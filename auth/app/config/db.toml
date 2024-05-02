@@ -1,0 +1,6 @@
+[main_database]
+host = "ex-db-main"
+port = "5432"
+username = "root"
+password = "900800"
+dbName = "ex"

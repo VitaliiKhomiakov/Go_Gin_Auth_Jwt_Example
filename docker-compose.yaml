@@ -1,0 +1,33 @@
+version: '3.9'
+
+services:
+  ex-auth:
+    container_name: ex-auth
+    build:
+      context: ./auth
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./auth/app:/app
+    networks:
+      - server-net
+
+  ex-db-main:
+    image: postgres:15-alpine
+    container_name: ex-db-main
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: localhost
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: 900800
+      POSTGRES_DB: ex
+    networks:
+      - server-net
+    ports:
+      - '7002:5432'
+    volumes:
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+
+networks:
+  server-net:
+    driver: bridge
