@@ -10,6 +10,11 @@ services:
       - "8001:8001"
     volumes:
       - ./app:/app
+    environment:
+      AUTH_DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    depends_on:
+      ex-db-main:
+        condition: service_healthy
     networks:
       - server-net
 
@@ -20,8 +25,14 @@ services:
     environment:
       POSTGRES_HOST: localhost
       POSTGRES_USER: root
-      POSTGRES_PASSWORD: 0123456789
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
       POSTGRES_DB: ex
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
     networks:
       - server-net
     ports:

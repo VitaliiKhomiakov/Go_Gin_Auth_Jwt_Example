@@ -10,3 +10,4 @@
 /docs/plans/
 .idea
 /app/tmp
+/.env

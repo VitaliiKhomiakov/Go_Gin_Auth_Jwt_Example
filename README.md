@@ -15,7 +15,24 @@ This project demonstrates how to build an authorization service using Go and the
 
 ## Installation and Setup
 
-Run command `docker-compose up --build`
+Copy `.env.example` to `.env` and set `DB_PASSWORD` to your local database password.
+Compose supplies this same required value to PostgreSQL and the application.
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+For an existing database, use its current password. Changing `.env` does not
+change the password stored in PostgreSQL. Preserve existing database data.
+
+Fresh development databases are initialized by `database/schema.sql`. Application
+startup checks required tables and columns without creating or migrating them.
+A schema mismatch requires a reviewed schema change before the application starts.
+
+Outside Compose, run Go commands from `app/`. Database settings come from
+`config/db.toml`; a nonempty `AUTH_DB_PASSWORD` overrides its password, while an
+explicitly empty override is rejected.
 
 ## Example CURL Requests
 
