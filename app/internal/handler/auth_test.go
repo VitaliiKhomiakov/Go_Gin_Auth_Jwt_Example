@@ -45,18 +45,23 @@ func (f *authFake) SignUp(ctx context.Context, input service.SignUpInput) (servi
 	return service.UserWithoutSecret{ID: 7, Email: input.Email, FirstName: input.FirstName, MiddleName: input.MiddleName, LastName: input.LastName, Birthday: time.Date(2000, 2, 29, 0, 0, 0, 0, time.UTC)}, f.err
 }
 
-func readAuthJSON(t *testing.T, response *httptest.ResponseRecorder) map[string]any {
+type authTestResponse interface {
+	tokenResponse | signUpResponse | identityResponse | errorResponse | healthResponse
+}
+
+func readAuthJSON[T authTestResponse](t *testing.T, response *httptest.ResponseRecorder) T {
 	t.Helper()
 	if response.Header().Get("Content-Type") != "application/json; charset=utf-8" {
 		t.Fatal("response must be JSON")
 	}
 
-	var body map[string]any
+	var body T
 	decoder := json.NewDecoder(response.Body)
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&body); err != nil {
 		t.Fatal("response must contain JSON")
 	}
-	var extra any
+	var extra json.RawMessage
 	if err := decoder.Decode(&extra); err != io.EOF {
 		t.Fatal("response must contain exactly one object")
 	}
@@ -91,18 +96,18 @@ func TestAuthHandlerCallsOperationOnce(t *testing.T) {
 			if response.Code != 200 || !reflect.DeepEqual(fake.calls, []string{name}) || fake.ctx != ctx || !errors.Is(fake.ctx.Err(), context.Canceled) {
 				t.Fatal("operation count/context/status changed")
 			}
-			result := readAuthJSON(t, response)
 			if name == "signup" {
 				want := service.SignUpInput{Email: "fixture@example.test", Password: "fixture-password", FirstName: "First", MiddleName: "Middle", LastName: "Last", Birthday: "2000-02-29"}
 				if fake.input != want {
 					t.Fatal("signup input mapping changed")
 				}
-				item, ok := result["item"].(map[string]any)
-				if !ok || len(result) != 1 || len(item) != 6 || item["id"] != float64(7) || item["email"] != want.Email || item["birthday"] != "2000-02-29T00:00:00Z" {
+				item := readAuthJSON[signUpResponse](t, response).Item
+				if item != (userResponse{ID: 7, Email: want.Email, FirstName: want.FirstName, MiddleName: want.MiddleName, LastName: want.LastName, Birthday: time.Date(2000, 2, 29, 0, 0, 0, 0, time.UTC)}) {
 					t.Fatal("signup public allowlist changed")
 				}
 			} else {
-				if len(result) != 2 || result["accessToken"] != "fixture-access" || result["refreshToken"] != "fixture-refresh" {
+				result := readAuthJSON[tokenResponse](t, response)
+				if result != (tokenResponse{AccessToken: "fixture-access", RefreshToken: "fixture-refresh"}) {
 					t.Fatal("token wire contract changed")
 				}
 				if name == "login" && (fake.email != "fixture@example.test" || fake.password != "fixture-password") {
@@ -139,7 +144,7 @@ func TestMalformedAuthBodiesStopBeforeOperations(t *testing.T) {
 			}
 			downstream := 0
 			router := gin.New()
-			router.POST("/auth", call, func(c *gin.Context) { downstream++; c.JSON(200, gin.H{"unexpected": true}) })
+			router.POST("/auth", call, func(c *gin.Context) { downstream++; c.Status(200) })
 			response := httptest.NewRecorder()
 
 			router.ServeHTTP(response, httptest.NewRequest("POST", "/auth", strings.NewReader(test.body)))
@@ -147,34 +152,32 @@ func TestMalformedAuthBodiesStopBeforeOperations(t *testing.T) {
 			if response.Code != test.status || len(fake.calls) != 0 || downstream != 0 {
 				t.Fatal("binding failure reached operation/downstream")
 			}
-			readAuthJSON(t, response)
+			readAuthJSON[errorResponse](t, response)
 		})
 	}
 }
 
 func TestProtectedIdentityContract(t *testing.T) {
 	for _, test := range []struct {
-		name    string
-		present bool
-		value   any
+		name  string
+		setup func(*gin.Context)
 	}{
-		{name: "missing"}, {name: "nil", present: true}, {name: "nil_pointer", present: true, value: (*model.User)(nil)},
-		{name: "wrong_type", present: true, value: "invalid"}, {name: "value", present: true, value: model.User{ID: 7}},
+		{"missing", func(*gin.Context) {}},
+		{"nil", func(c *gin.Context) { c.Set("user", nil) }},
+		{"nil_pointer", func(c *gin.Context) { c.Set("user", (*model.User)(nil)) }},
+		{"wrong_type", func(c *gin.Context) { c.Set("user", "invalid") }},
+		{"value", func(c *gin.Context) { c.Set("user", model.User{ID: 7}) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h := NewAuth(&authFake{})
 			downstream := 0
 			router := gin.New()
-			router.GET("/auth", func(c *gin.Context) {
-				if test.present {
-					c.Set("user", test.value)
-				}
-			}, h.Me, func(c *gin.Context) { downstream++; c.JSON(200, gin.H{"unexpected": true}) })
+			router.GET("/auth", test.setup, h.Me, func(c *gin.Context) { downstream++; c.Status(200) })
 			response := httptest.NewRecorder()
 
 			router.ServeHTTP(response, httptest.NewRequest("GET", "/auth", nil))
 
-			if response.Code != 500 || downstream != 0 || readAuthJSON(t, response)["error"] != "Internal server error" {
+			if response.Code != 500 || downstream != 0 || readAuthJSON[errorResponse](t, response) != (errorResponse{Error: "Internal server error"}) {
 				t.Fatal("invalid identity did not stop with safe 500")
 			}
 		})
@@ -190,8 +193,8 @@ func TestProtectedIdentityContract(t *testing.T) {
 
 	router.ServeHTTP(response, httptest.NewRequest("GET", "/auth", nil))
 
-	body := readAuthJSON(t, response)
-	if response.Code != 200 || len(body) != 2 || body["id"] != float64(7) || body["email"] != "fixture@example.test" || len(fake.calls) != 0 {
+	body := readAuthJSON[identityResponse](t, response)
+	if response.Code != 200 || body != (identityResponse{ID: 7, Email: "fixture@example.test"}) || len(fake.calls) != 0 {
 		t.Fatal("validate changed allowlist or repeated authentication")
 	}
 }
@@ -220,8 +223,8 @@ func TestAuthenticationErrorsDoNotExposeSecrets(t *testing.T) {
 			if response.Code != test.status || downstream != 0 || len(fake.calls) != 1 {
 				t.Fatal("error status/count changed")
 			}
-			body := readAuthJSON(t, response)
-			if len(body) != 1 || body["error"] != test.message {
+			body := readAuthJSON[errorResponse](t, response)
+			if body != (errorResponse{Error: test.message}) {
 				t.Fatal("error details were exposed")
 			}
 		})
@@ -252,8 +255,8 @@ func TestHealthUsesRequestContext(t *testing.T) {
 		if failure {
 			status = "ERROR"
 		}
-		body := readAuthJSON(t, response)
-		if response.Code != 200 || calls != 1 || len(body) != 1 || body["DataBase"] != status {
+		body := readAuthJSON[healthResponse](t, response)
+		if response.Code != 200 || calls != 1 || body.Database != status {
 			t.Fatal("health contract changed")
 		}
 	}

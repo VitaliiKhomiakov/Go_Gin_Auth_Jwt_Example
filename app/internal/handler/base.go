@@ -7,8 +7,16 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type messageResponse struct {
+	Message string `json:"message"`
+}
+
+type healthResponse struct {
+	Database string `json:"DataBase"`
+}
+
 func Base(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"message": "It works"})
+	c.JSON(http.StatusOK, messageResponse{Message: "It works"})
 }
 
 func NewHealth(check func(context.Context) error) gin.HandlerFunc {
@@ -18,6 +26,6 @@ func NewHealth(check func(context.Context) error) gin.HandlerFunc {
 			status = "ERROR"
 		}
 
-		c.JSON(http.StatusOK, gin.H{"DataBase": status})
+		c.JSON(http.StatusOK, healthResponse{Database: status})
 	}
 }

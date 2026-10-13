@@ -1,7 +1,8 @@
 # Golang Gin JWT Example
 
 A Go and Gin authentication example with PostgreSQL, user registration, login,
-and JWT access and refresh tokens.
+and JWT access and refresh tokens. Each user can keep five sessions; a new login
+replaces the oldest when the limit is reached.
 
 ## Run
 
@@ -46,6 +47,8 @@ curl http://localhost:8001/auth/me \
 ```
 
 ### Refresh
+
+Refresh replaces both tokens; the previous access and refresh tokens stop working.
 
 ```bash
 curl -X POST http://localhost:8001/auth/refresh \

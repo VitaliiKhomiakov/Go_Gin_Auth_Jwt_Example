@@ -149,7 +149,7 @@ func TestSignupDuplicateEmailRace(t *testing.T) {
 	}
 }
 
-type fixedCodec struct{}
+type fixedCodec struct{ *service.JWTCodec }
 
 func (fixedCodec) Issue(user *model.User) (service.TokenPair, error) {
 	return service.TokenPair{AccessToken: "rollback-access", RefreshToken: "existing-other-user-refresh"}, nil
@@ -162,14 +162,19 @@ func (fixedCodec) Validate(string, service.TokenType) (uint, error) {
 func TestTokenIssuanceRollback(t *testing.T) {
 	db := authDatabase(t)
 	store := repository.NewAuthStore(db)
-	auth := service.NewAuth(store, fixedCodec{})
+	codec := realCodec(t)
+	auth := service.NewAuth(store, fixedCodec{codec})
 	user, err := auth.SignUp(context.Background(), service.SignUpInput{Email: "rollback@example.test", Password: "fixture-password"})
 	if err != nil {
 		t.Fatal("rollback user creation failed")
 	}
 	prior := make([]model.Token, 0, 7)
 	for i := 0; i < 6; i++ {
-		prior = append(prior, model.Token{UserID: uint64(user.ID), AccessToken: fmt.Sprint("prior-access-", i), RefreshToken: fmt.Sprint("prior-refresh-", i)})
+		pair, err := codec.Issue(&model.User{ID: user.ID})
+		if err != nil {
+			t.Fatal("rollback pair fixture failed")
+		}
+		prior = append(prior, model.Token{UserID: uint64(user.ID), AccessToken: pair.AccessToken, RefreshToken: pair.RefreshToken})
 	}
 	prior = append(prior, model.Token{UserID: uint64(user.ID) + 100, AccessToken: "other-user-access", RefreshToken: "existing-other-user-refresh"})
 	if err := db.Create(&prior).Error; err != nil {
@@ -181,7 +186,7 @@ func TestTokenIssuanceRollback(t *testing.T) {
 	}
 	deleted := false
 	if err := db.Callback().Delete().After("gorm:delete").Register("test:observe_cleanup", func(tx *gorm.DB) {
-		if tx.Statement.Table == "token" && tx.Error == nil && tx.RowsAffected == 6 {
+		if tx.Statement.Table == "token" && tx.Error == nil && tx.RowsAffected == 2 {
 			deleted = true
 		}
 	}); err != nil {
@@ -205,6 +210,16 @@ func TestTokenIssuanceRollback(t *testing.T) {
 			t.Fatal("rollback changed prior session values")
 		}
 	}
+	currentAuth := service.NewAuth(store, codec)
+	for _, row := range before {
+		if row.UserID == uint64(user.ID) {
+			pair := service.TokenPair{AccessToken: row.AccessToken, RefreshToken: row.RefreshToken}
+			requireAccess(t, currentAuth, pair, true)
+			if _, err := currentAuth.RefreshSession(context.Background(), pair.RefreshToken); err != nil {
+				t.Fatal("failed insertion consumed prior refresh")
+			}
+		}
+	}
 }
 
 func TestAuthRepositoryCancellation(t *testing.T) {
@@ -222,7 +237,10 @@ func TestAuthRepositoryCancellation(t *testing.T) {
 			return err
 		},
 		func() error {
-			return store.WithSessionTransaction(ctx, func(service.SessionWriter) error { t.Fatal("cancelled transaction invoked callback"); return nil })
+			return store.WithSessionTransaction(ctx, 7, func(*model.User, service.SessionWriter) error {
+				t.Fatal("cancelled transaction invoked callback")
+				return nil
+			})
 		},
 	}
 	for _, check := range checks {
@@ -230,29 +248,42 @@ func TestAuthRepositoryCancellation(t *testing.T) {
 			t.Fatal("repository lost cancellation")
 		}
 	}
-	for _, operation := range []string{"count", "delete", "save"} {
-		err := store.WithSessionTransaction(context.Background(), func(writer service.SessionWriter) error {
+	if err := store.CreateUser(context.Background(), user); err != nil {
+		t.Fatal("cancellation user fixture failed")
+	}
+	for _, operation := range []string{"page", "delete", "save", "find", "replace"} {
+		err := store.WithSessionTransaction(context.Background(), user.ID, func(_ *model.User, writer service.SessionWriter) error {
 			switch operation {
-			case "count":
-				_, err := writer.CountTokens(ctx, 7)
+			case "page":
+				_, err := writer.TokensAfter(ctx, 0)
 				return err
 			case "delete":
-				return writer.DeleteTokens(ctx, 7)
+				return writer.DeleteTokenIDs(ctx, []uint{1})
+			case "find":
+				_, err := writer.FindRefreshToken(ctx, "cancelled-refresh")
+				return err
+			case "replace":
+				_, err := writer.ReplaceToken(ctx, model.Token{ID: 1}, service.TokenPair{})
+				return err
 			default:
-				return writer.SaveToken(ctx, &model.Token{UserID: 7, AccessToken: "cancelled-access", RefreshToken: "cancelled-refresh"})
+				return writer.SaveToken(ctx, service.TokenPair{AccessToken: "cancelled-access", RefreshToken: "cancelled-refresh"})
 			}
 		})
 		if !errors.Is(err, context.Canceled) {
 			t.Fatal("transaction writer lost cancellation")
 		}
 	}
+	if _, err := store.HasAccessToken(ctx, user.ID, "cancelled-access"); !errors.Is(err, context.Canceled) {
+		t.Fatal("access lookup lost cancellation")
+	}
 	var count int64
-	if err := db.Model(&model.User{}).Count(&count).Error; err != nil || count != 0 {
+	if err := db.Model(&model.User{}).Count(&count).Error; err != nil || count != 1 {
 		t.Fatal("cancelled user insert persisted data")
 	}
 	if err := db.Model(&model.Token{}).Count(&count).Error; err != nil || count != 0 {
 		t.Fatal("cancelled token insert persisted data")
 	}
+
 }
 
 func TestAuthRepositoryDoesNotLogSecrets(t *testing.T) {
@@ -282,17 +313,42 @@ func TestAuthRepositoryDoesNotLogSecrets(t *testing.T) {
 	}
 
 	token := &model.Token{UserID: uint64(user.ID), AccessToken: "synthetic-private-access-token", RefreshToken: "synthetic-private-refresh-token"}
-	if err := store.WithSessionTransaction(context.Background(), func(writer service.SessionWriter) error { return writer.SaveToken(context.Background(), token) }); err != nil {
+	if err := store.WithSessionTransaction(context.Background(), user.ID, func(_ *model.User, writer service.SessionWriter) error {
+		return writer.SaveToken(context.Background(), service.TokenPair{AccessToken: token.AccessToken, RefreshToken: token.RefreshToken})
+	}); err != nil {
 		t.Fatal("privacy session creation failed")
 	}
 	token.ID = 0
-	if err := store.WithSessionTransaction(context.Background(), func(writer service.SessionWriter) error { return writer.SaveToken(context.Background(), token) }); err == nil {
+	if err := store.WithSessionTransaction(context.Background(), user.ID, func(_ *model.User, writer service.SessionWriter) error {
+		return writer.SaveToken(context.Background(), service.TokenPair{AccessToken: token.AccessToken, RefreshToken: token.RefreshToken})
+	}); err == nil {
 		t.Fatal("privacy duplicate session did not fail")
 	}
 
 	if output.Len() != 0 {
 		t.Fatal("auth repository emitted SQL diagnostics")
 	}
+}
+
+type authRouteUser struct {
+	ID         uint   `json:"id"`
+	Email      string `json:"email"`
+	FirstName  string `json:"firstName"`
+	MiddleName string `json:"middleName"`
+	LastName   string `json:"lastName"`
+	Birthday   string `json:"birthday"`
+}
+
+type authRouteResponse struct {
+	Item           *authRouteUser `json:"item"`
+	ID             uint           `json:"id"`
+	Email          string         `json:"email"`
+	AccessToken    string         `json:"accessToken"`
+	RefreshToken   string         `json:"refreshToken"`
+	Error          string         `json:"error"`
+	Database       string         `json:"DataBase"`
+	fieldCount     int
+	itemFieldCount int
 }
 
 func TestAuthRouteJourney(t *testing.T) {
@@ -304,7 +360,7 @@ func TestAuthRouteJourney(t *testing.T) {
 	auth := service.NewAuth(repository.NewAuthStore(db), realCodec(t))
 	router := gin.New()
 	route.InitRoute(router, handler.NewAuth(auth), middleware.AuthMiddleware(auth), handler.NewHealth(pool.PingContext))
-	request := func(method, path, body, token string) (int, map[string]any) {
+	request := func(method, path, body, token string) (int, authRouteResponse) {
 		t.Helper()
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -315,23 +371,37 @@ func TestAuthRouteJourney(t *testing.T) {
 
 		router.ServeHTTP(response, req)
 
-		var result map[string]any
-		decoder := json.NewDecoder(response.Body)
+		var result authRouteResponse
+		payload := response.Body.Bytes()
+		decoder := json.NewDecoder(bytes.NewReader(payload))
+		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&result); err != nil {
 			t.Fatal("route response was not JSON")
 		}
-		var extra any
+		var extra json.RawMessage
 		if err := decoder.Decode(&extra); err != io.EOF {
 			t.Fatal("route returned multiple responses")
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(payload, &fields); err != nil {
+			t.Fatal("route fields decode failed")
+		}
+		result.fieldCount = len(fields)
+		if fields["item"] != nil {
+			var itemFields map[string]json.RawMessage
+			if err := json.Unmarshal(fields["item"], &itemFields); err != nil {
+				t.Fatal("route item shape decode failed")
+			}
+			result.itemFieldCount = len(itemFields)
 		}
 		return response.Code, result
 	}
 	status, signup := request("POST", "/auth/signUp", `{"email":"journey@example.test","password":"fixture-password","confirmPassword":"fixture-password","firstName":"First","lastName":"Last","birthday":"2000-02-29","roles":["ADMIN"],"enabled":false}`, "")
-	item, ok := signup["item"].(map[string]any)
-	if status != 200 || !ok || len(item) != 6 || item["birthday"] != "2000-02-29T00:00:00Z" {
+	item := signup.Item
+	if status != 200 || item == nil || signup.itemFieldCount != 6 || item.Birthday != "2000-02-29T00:00:00Z" {
 		t.Fatal("route signup failed or changed allowlist")
 	}
-	id := item["id"]
+	id := item.ID
 	var persisted model.User
 	if err := db.Where("email = ?", "journey@example.test").First(&persisted).Error; err != nil {
 		t.Fatal("registered user read failed")
@@ -344,43 +414,52 @@ func TestAuthRouteJourney(t *testing.T) {
 	if err != nil || !valid || upgrade || !strings.HasPrefix(persisted.Password, "$argon2id$") {
 		t.Fatal("signup did not persist the accepted password format")
 	}
-	if float64(persisted.ID) != id {
+	if persisted.ID != id {
 		t.Fatal("signup identity differs from persisted user")
 	}
 	status, login := request("POST", "/auth/login", `{"emailOrPhone":"journey@example.test","password":"fixture-password"}`, "")
-	if status != 200 || len(login) != 2 {
+	if status != 200 || login.fieldCount != 2 {
 		t.Fatal("route login failed")
 	}
-	access, ok := login["accessToken"].(string)
-	if !ok {
+	access := login.AccessToken
+	if access == "" {
 		t.Fatal("route access missing")
 	}
-	refresh, ok := login["refreshToken"].(string)
-	if !ok {
+	refresh := login.RefreshToken
+	if refresh == "" {
 		t.Fatal("route refresh missing")
 	}
 	status, identity := request("GET", "/auth/me", "", access)
-	if status != 200 || len(identity) != 2 || identity["id"] != id || identity["email"] != "journey@example.test" {
+	if status != 200 || identity.fieldCount != 2 || identity.ID != id || identity.Email != "journey@example.test" {
 		t.Fatal("login access did not authenticate")
 	}
-	body, err := json.Marshal(map[string]string{"refreshToken": refresh})
+	body, err := json.Marshal(struct {
+		RefreshToken string `json:"refreshToken"`
+	}{refresh})
 	if err != nil {
 		t.Fatal("refresh fixture encoding failed")
 	}
 	status, refreshed := request("POST", "/auth/refresh", string(body), "")
-	if status != 200 || len(refreshed) != 2 {
+	if status != 200 || refreshed.fieldCount != 2 {
 		t.Fatal("route refresh failed")
 	}
-	nextAccess, ok := refreshed["accessToken"].(string)
-	if !ok {
+	nextAccess := refreshed.AccessToken
+	if nextAccess == "" {
 		t.Fatal("refreshed access missing")
 	}
 	status, identity = request("GET", "/auth/me", "", nextAccess)
-	if status != 200 || identity["id"] != id || len(identity) != 2 {
+	if status != 200 || identity.ID != id || identity.fieldCount != 2 {
 		t.Fatal("refreshed access did not authenticate")
 	}
+	if status, body := request("GET", "/auth/me", "", access); status != 401 || body.Error != "Authentication failed" || body.fieldCount != 1 {
+		t.Fatal("old access remained usable after rotation")
+	}
+	if status, rejected := request("POST", "/auth/refresh", string(body), ""); status != 401 || rejected.Error != "Authentication failed" || rejected.fieldCount != 1 {
+		t.Fatal("old refresh remained usable after rotation")
+	}
+
 	var count int64
-	if err := db.Model(&model.Token{}).Count(&count).Error; err != nil || count != 2 {
+	if err := db.Model(&model.Token{}).Count(&count).Error; err != nil || count != 1 {
 		t.Fatal("route tokens did not persist")
 	}
 	t.Run("current_enabled_state", func(t *testing.T) {
@@ -394,17 +473,23 @@ func TestAuthRouteJourney(t *testing.T) {
 		}
 
 		status, rejected := request("POST", "/auth/login", `{"emailOrPhone":"journey@example.test","password":"fixture-password"}`, "")
-		if status != 401 || !reflect.DeepEqual(rejected, map[string]any{"error": "Incorrect credentials"}) {
+		if status != 401 || !reflect.DeepEqual(rejected, authRouteResponse{Error: "Incorrect credentials", fieldCount: 1}) {
 			t.Fatal("disabled login did not return generic credentials rejection")
 		}
 		for _, token := range []string{access, nextAccess} {
 			status, rejected = request("GET", "/auth/me", "", token)
-			if status != 401 || !reflect.DeepEqual(rejected, map[string]any{"error": "Authentication failed"}) {
+			if status != 401 || !reflect.DeepEqual(rejected, authRouteResponse{Error: "Authentication failed", fieldCount: 1}) {
 				t.Fatal("issued access claims bypassed current disabled state")
 			}
 		}
-		status, rejected = request("POST", "/auth/refresh", string(body), "")
-		if status != 401 || !reflect.DeepEqual(rejected, map[string]any{"error": "Authentication failed"}) {
+		currentBody, err := json.Marshal(struct {
+			RefreshToken string `json:"refreshToken"`
+		}{refreshed.RefreshToken})
+		if err != nil {
+			t.Fatal("current refresh encoding failed")
+		}
+		status, rejected = request("POST", "/auth/refresh", string(currentBody), "")
+		if status != 401 || !reflect.DeepEqual(rejected, authRouteResponse{Error: "Authentication failed", fieldCount: 1}) {
 			t.Fatal("issued refresh claims bypassed current disabled state")
 		}
 		var after []model.Token
@@ -416,19 +501,19 @@ func TestAuthRouteJourney(t *testing.T) {
 		if update.Error != nil || update.RowsAffected != 1 {
 			t.Fatal("isolated user reenable failed")
 		}
-		status, identity := request("GET", "/auth/me", "", access)
-		if status != 200 || !reflect.DeepEqual(identity, map[string]any{"id": id, "email": "journey@example.test"}) {
+		status, identity := request("GET", "/auth/me", "", nextAccess)
+		if status != 200 || !reflect.DeepEqual(identity, authRouteResponse{ID: id, Email: "journey@example.test", fieldCount: 2}) {
 			t.Fatal("reenabled user could not authenticate issued access")
 		}
 		status, login := request("POST", "/auth/login", `{"emailOrPhone":"journey@example.test","password":"fixture-password"}`, "")
-		if status != 200 || len(login) != 2 || login["accessToken"] == nil || login["refreshToken"] == nil {
+		if status != 200 || login.fieldCount != 2 || login.AccessToken == "" || login.RefreshToken == "" {
 			t.Fatal("reenabled user could not sign in")
 		}
-		status, refreshed := request("POST", "/auth/refresh", string(body), "")
-		if status != 200 || len(refreshed) != 2 || refreshed["accessToken"] == nil || refreshed["refreshToken"] == nil {
+		status, refreshed := request("POST", "/auth/refresh", string(currentBody), "")
+		if status != 200 || refreshed.fieldCount != 2 || refreshed.AccessToken == "" || refreshed.RefreshToken == "" {
 			t.Fatal("reenabled user could not refresh issued session")
 		}
-		if err := db.Model(&model.Token{}).Count(&count).Error; err != nil || count != 4 {
+		if err := db.Model(&model.Token{}).Count(&count).Error; err != nil || count != 2 {
 			t.Fatal("reenabled login and refresh did not persist sessions")
 		}
 	})
@@ -444,7 +529,7 @@ func TestAuthRouteJourney(t *testing.T) {
 	if status, _ := request("POST", "/auth/signUp", `{"email":"journey@example.test","password":"fixture-password","confirmPassword":"fixture-password","firstName":"First","lastName":"Last"}`, ""); status != 409 {
 		t.Fatal("duplicate signup did not return 409")
 	}
-	if status, body := request("GET", "/health", "", ""); status != 200 || body["DataBase"] != "OK" {
+	if status, body := request("GET", "/health", "", ""); status != 200 || body.Database != "OK" {
 		t.Fatal("health wiring failed")
 	}
 	old := httptest.NewRecorder()

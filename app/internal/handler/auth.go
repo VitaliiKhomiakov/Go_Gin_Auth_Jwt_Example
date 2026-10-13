@@ -27,7 +27,7 @@ func NewAuth(auth AuthService) *Auth {
 func (h *Auth) Login(c *gin.Context) {
 	var input loginRequest
 	if err := c.ShouldBindJSON(&input); err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Incorrect credentials"})
+		c.AbortWithStatusJSON(http.StatusBadRequest, errorResponse{Error: "Incorrect credentials"})
 		return
 	}
 
@@ -43,7 +43,7 @@ func (h *Auth) Login(c *gin.Context) {
 func (h *Auth) Refresh(c *gin.Context) {
 	var input refreshRequest
 	if err := c.ShouldBindJSON(&input); err != nil {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Refresh token is incorrect"})
+		c.AbortWithStatusJSON(http.StatusUnauthorized, errorResponse{Error: "Refresh token is incorrect"})
 		return
 	}
 
@@ -59,11 +59,11 @@ func (h *Auth) Refresh(c *gin.Context) {
 func (h *Auth) SignUp(c *gin.Context) {
 	var input signUpRequest
 	if err := c.ShouldBindJSON(&input); err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Incorrect data"})
+		c.AbortWithStatusJSON(http.StatusBadRequest, errorResponse{Error: "Incorrect data"})
 		return
 	}
 	if input.Password != input.ConfirmPassword {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Incorrect data", "message": "Passwords do not match"})
+		c.AbortWithStatusJSON(http.StatusBadRequest, errorResponse{Error: "Incorrect data", Message: "Passwords do not match"})
 		return
 	}
 
@@ -73,16 +73,16 @@ func (h *Auth) SignUp(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"item": publicUser(user)})
+	c.JSON(http.StatusOK, signUpResponse{Item: publicUser(user)})
 }
 
 func (h *Auth) Me(c *gin.Context) {
 	identity, exists := c.Get("user")
 	user, ok := identity.(*model.User)
 	if !exists || !ok || user == nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errorResponse{Error: "Internal server error"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"id": user.ID, "email": user.Email})
+	c.JSON(http.StatusOK, identityResponse{ID: user.ID, Email: user.Email})
 }

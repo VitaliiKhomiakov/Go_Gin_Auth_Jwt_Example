@@ -56,3 +56,17 @@ func publicUser(user service.UserWithoutSecret) userResponse {
 		MiddleName: user.MiddleName, LastName: user.LastName, Birthday: user.Birthday,
 	}
 }
+
+type errorResponse struct {
+	Error   string `json:"error"`
+	Message string `json:"message,omitempty"`
+}
+
+type signUpResponse struct {
+	Item userResponse `json:"item"`
+}
+
+type identityResponse struct {
+	ID    uint   `json:"id"`
+	Email string `json:"email"`
+}

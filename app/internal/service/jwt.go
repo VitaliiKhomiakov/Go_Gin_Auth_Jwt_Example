@@ -30,16 +30,17 @@ type jwtUser struct {
 }
 
 type tokenClaims struct {
-	UserID    uint      `json:"userID"`
-	ExpiresAt int64     `json:"exp"`
-	TokenType TokenType `json:"tokenType"`
-	ID        string    `json:"jti"`
-	User      *jwtUser  `json:"user,omitempty"`
-	now       int64
+	UserID       uint      `json:"userID"`
+	ExpiresAt    int64     `json:"exp"`
+	TokenType    TokenType `json:"tokenType"`
+	ID           string    `json:"jti"`
+	User         *jwtUser  `json:"user,omitempty"`
+	now          int64
+	ignoreExpiry bool
 }
 
 func (c tokenClaims) Valid() error {
-	if c.UserID == 0 || c.ExpiresAt <= c.now || strings.TrimSpace(c.ID) == "" {
+	if c.UserID == 0 || (c.ExpiresAt <= 0 || (!c.ignoreExpiry && c.ExpiresAt <= c.now)) || strings.TrimSpace(c.ID) == "" {
 		return ErrInvalidToken
 	}
 
@@ -140,12 +141,36 @@ func (c JWTCodec) signingKey(tokenType TokenType) ([]byte, error) {
 }
 
 func (c JWTCodec) Validate(tokenString string, tokenType TokenType) (uint, error) {
+	return c.parse(tokenString, tokenType, false)
+}
+
+func (c JWTCodec) MatchesSessionContract(userID uint, pair TokenPair) (bool, error) {
+	for _, token := range []struct {
+		value   string
+		purpose TokenType
+	}{{pair.AccessToken, AccessToken}, {pair.RefreshToken, RefreshToken}} {
+		id, err := c.parse(token.value, token.purpose, true)
+		if errors.Is(err, ErrInvalidToken) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if id != userID {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+func (c JWTCodec) parse(tokenString string, tokenType TokenType, ignoreExpiry bool) (uint, error) {
 	key, err := c.signingKey(tokenType)
 	if err != nil {
 		return 0, err
 	}
 
-	claims := tokenClaims{now: c.now().Unix()}
+	claims := tokenClaims{now: c.now().Unix(), ignoreExpiry: ignoreExpiry}
 	parser := jwt.Parser{ValidMethods: []string{jwt.SigningMethodHS256.Alg()}}
 	token, err := parser.ParseWithClaims(tokenString, &claims, func(token *jwt.Token) (interface{}, error) {
 		if token.Method != jwt.SigningMethodHS256 {

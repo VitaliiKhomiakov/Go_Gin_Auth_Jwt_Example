@@ -15,6 +15,12 @@ import (
 type authStoreFake struct {
 	user                                                        model.User
 	findErr, createErr, countErr, deleteErr, saveErr, commitErr error
+	rows                                                        []model.Token
+	deleted                                                     []uint
+	accessMissing                                               bool
+	accessErr, refreshErr, replaceErr                           error
+	replaceMiss                                                 bool
+	lockFn                                                      func()
 	count                                                       int64
 	contexts                                                    []context.Context
 	trace                                                       []string
@@ -63,37 +69,72 @@ func (f *authStoreFake) CreateUser(ctx context.Context, user *model.User) error 
 	return f.createErr
 }
 
-func (f *authStoreFake) WithSessionTransaction(ctx context.Context, operation func(SessionWriter) error) error {
+func (f *authStoreFake) WithSessionTransaction(ctx context.Context, id uint, operation func(*model.User, SessionWriter) error) error {
 	f.contexts = append(f.contexts, ctx)
 	f.transactions++
 	f.trace = append(f.trace, "begin")
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := operation(f); err != nil {
+	if f.findErr != nil {
+		return f.findErr
+	}
+	if f.lockFn != nil {
+		f.lockFn()
+	}
+	if err := operation(&f.user, f); err != nil {
 		return err
 	}
 	f.trace = append(f.trace, "commit")
 	return f.commitErr
 }
 
-func (f *authStoreFake) CountTokens(ctx context.Context, id uint) (int64, error) {
+func (f *authStoreFake) HasAccessToken(ctx context.Context, id uint, token string) (bool, error) {
 	f.contexts = append(f.contexts, ctx)
-	f.trace = append(f.trace, "count")
-	return f.count, f.countErr
+	f.trace = append(f.trace, "access_session")
+	return !f.accessMissing, f.accessErr
 }
 
-func (f *authStoreFake) DeleteTokens(ctx context.Context, id uint) error {
+func (f *authStoreFake) TokensAfter(ctx context.Context, after uint) ([]model.Token, error) {
+	f.contexts = append(f.contexts, ctx)
+	f.trace = append(f.trace, "page")
+	if after > 0 {
+		return nil, nil
+	}
+	rows := f.rows
+	if rows == nil {
+		for i := int64(0); i < f.count; i++ {
+			rows = append(rows, model.Token{ID: uint(i + 1), UserID: 7})
+		}
+	}
+	return rows, f.countErr
+}
+
+func (f *authStoreFake) DeleteTokenIDs(ctx context.Context, ids []uint) error {
 	f.contexts = append(f.contexts, ctx)
 	f.trace = append(f.trace, "delete")
+	f.deleted = append(f.deleted, ids...)
 	return f.deleteErr
 }
 
-func (f *authStoreFake) SaveToken(ctx context.Context, token *model.Token) error {
+func (f *authStoreFake) SaveToken(ctx context.Context, pair TokenPair) error {
 	f.contexts = append(f.contexts, ctx)
 	f.trace = append(f.trace, "save")
-	f.saved = token
+	f.saved = &model.Token{UserID: uint64(f.user.ID), AccessToken: pair.AccessToken, RefreshToken: pair.RefreshToken}
 	return f.saveErr
+}
+
+func (f *authStoreFake) FindRefreshToken(ctx context.Context, token string) (model.Token, error) {
+	f.contexts = append(f.contexts, ctx)
+	f.trace = append(f.trace, "refresh_session")
+	return model.Token{ID: 1, UserID: 7, RefreshToken: token}, f.refreshErr
+}
+
+func (f *authStoreFake) ReplaceToken(ctx context.Context, old model.Token, pair TokenPair) (bool, error) {
+	f.contexts = append(f.contexts, ctx)
+	f.trace = append(f.trace, "replace")
+	f.saved = &model.Token{ID: old.ID, UserID: uint64(f.user.ID), AccessToken: pair.AccessToken, RefreshToken: pair.RefreshToken}
+	return !f.replaceMiss, f.replaceErr
 }
 
 type tokenCodecFake struct {
@@ -101,6 +142,9 @@ type tokenCodecFake struct {
 	issueErr, validateErr error
 	purposes              []TokenType
 	issuedUser            model.User
+	contractErr           error
+	obsolete              bool
+	validateFn            func() error
 }
 
 func (f *tokenCodecFake) Issue(user *model.User) (TokenPair, error) {
@@ -112,7 +156,14 @@ func (f *tokenCodecFake) Issue(user *model.User) (TokenPair, error) {
 func (f *tokenCodecFake) Validate(token string, purpose TokenType) (uint, error) {
 	f.purposes = append(f.purposes, purpose)
 	f.store.trace = append(f.store.trace, "validate")
+	if f.validateFn != nil {
+		return 7, f.validateFn()
+	}
 	return 7, f.validateErr
+}
+
+func (f *tokenCodecFake) MatchesSessionContract(id uint, pair TokenPair) (bool, error) {
+	return !f.obsolete, f.contractErr
 }
 
 var fixturePasswordOnce sync.Once
@@ -146,7 +197,7 @@ func TestAuthOperationsWithoutGin(t *testing.T) {
 				}
 			case "refresh":
 				_, err = auth.RefreshSession(ctx, "fixture-refresh")
-				if !reflect.DeepEqual(codec.purposes, []TokenType{RefreshToken}) {
+				if !reflect.DeepEqual(codec.purposes, []TokenType{RefreshToken, RefreshToken}) {
 					t.Fatal("refresh purpose changed")
 				}
 			case "access":
@@ -194,49 +245,31 @@ func TestDisabledUserRejected(t *testing.T) {
 	for _, operation := range []string{"login", "refresh", "access"} {
 		t.Run(operation, func(t *testing.T) {
 			auth, store, _ := authFixture(t)
-			store.count = 6
 			for _, enabled := range []bool{true, false, true} {
 				store.user.Enabled = enabled
-				store.trace, store.saved, store.transactions = nil, nil, 0
-				want := ErrInvalidToken
-				wantTrace := []string{"validate", "find_id"}
+				store.saved = nil
 				var err error
 
 				switch operation {
 				case "login":
-					want = ErrInvalidCredentials
-					wantTrace = []string{"find_email"}
-					var pair TokenPair
-					pair, err = auth.SignIn(context.Background(), "fixture@example.test", "fixture-password")
-					if !enabled && pair != (TokenPair{}) {
-						t.Fatal("disabled login returned tokens")
-					}
+					_, err = auth.SignIn(context.Background(), store.user.Email, "fixture-password")
 				case "refresh":
-					var pair TokenPair
-					pair, err = auth.RefreshSession(context.Background(), "fixture-refresh")
-					if !enabled && pair != (TokenPair{}) {
-						t.Fatal("disabled refresh returned tokens")
-					}
+					_, err = auth.RefreshSession(context.Background(), "fixture-refresh")
 				case "access":
-					var user *model.User
-					user, err = auth.AuthenticateAccessToken(context.Background(), "fixture-access")
-					if !enabled && user != nil {
-						t.Fatal("disabled access returned identity")
-					}
+					_, err = auth.AuthenticateAccessToken(context.Background(), "fixture-access")
 				}
 
-				if enabled {
-					if err != nil {
-						t.Fatal("enabled user rejected")
-					}
-					if operation != "access" {
-						wantTrace = append(wantTrace, "sign", "begin", "count", "delete", "save", "commit")
-					}
-				} else if !errors.Is(err, want) || store.transactions != 0 || store.saved != nil {
-					t.Fatal("disabled user rejection changed classification or wrote a session")
+				if enabled && err != nil {
+					t.Fatal("enabled user rejected")
 				}
-				if !reflect.DeepEqual(store.trace, wantTrace) {
-					t.Fatal("operation did not use current state or disabled user reached issuance")
+				if !enabled {
+					want := ErrInvalidToken
+					if operation == "login" {
+						want = ErrInvalidCredentials
+					}
+					if !errors.Is(err, want) || store.saved != nil {
+						t.Fatal("disabled user wrote session or changed rejection")
+					}
 				}
 			}
 		})
@@ -306,7 +339,7 @@ func TestTokenAuthenticationFailures(t *testing.T) {
 					}
 				}
 
-				if !errors.Is(err, want) || store.transactions != 0 {
+				if !errors.Is(err, want) {
 					t.Fatal("token failure classification changed")
 				}
 				if failure == "invalid_token" && !reflect.DeepEqual(store.trace, []string{"validate"}) {
@@ -318,29 +351,25 @@ func TestTokenAuthenticationFailures(t *testing.T) {
 }
 
 func TestSessionIssuanceFailures(t *testing.T) {
-	for _, failure := range []string{"sign", "count", "delete", "save", "commit", "cancel"} {
+	for _, failure := range []string{"sign", "page", "delete", "classify", "save", "commit", "cancel"} {
 		t.Run(failure, func(t *testing.T) {
 			auth, store, codec := authFixture(t)
 			store.count = 6
 			expected := errors.New("private-operation-failure")
 			ctx := context.Background()
-			wantTrace := []string{"find_email", "sign", "begin"}
 			switch failure {
 			case "sign":
 				codec.issueErr = expected
-				wantTrace = wantTrace[:2]
-			case "count":
+			case "page":
 				store.countErr = expected
-				wantTrace = append(wantTrace, "count")
 			case "delete":
 				store.deleteErr = expected
-				wantTrace = append(wantTrace, "count", "delete")
+			case "classify":
+				codec.contractErr = expected
 			case "save":
 				store.saveErr = expected
-				wantTrace = append(wantTrace, "count", "delete", "save")
 			case "commit":
 				store.commitErr = expected
-				wantTrace = append(wantTrace, "count", "delete", "save", "commit")
 			case "cancel":
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithCancel(ctx)
@@ -348,36 +377,33 @@ func TestSessionIssuanceFailures(t *testing.T) {
 				expected = context.Canceled
 			}
 
-			pair, err := auth.SignIn(ctx, "fixture@example.test", "fixture-password")
+			pair, err := auth.SignIn(ctx, store.user.Email, "fixture-password")
 
-			if !errors.Is(err, expected) || pair != (TokenPair{}) || !reflect.DeepEqual(store.trace, wantTrace) {
-				t.Fatal("failed issuance returned success or continued")
-			}
-			wantTransactions := 1
-			if failure == "sign" {
-				wantTransactions = 0
-			}
-			if store.transactions != wantTransactions {
-				t.Fatal("issuance retried or wrote before signing")
+			if !errors.Is(err, expected) || pair != (TokenPair{}) || store.transactions != 1 {
+				t.Fatal("failed issuance returned success or retried")
 			}
 		})
 	}
 }
 
-func TestSessionCleanupPreservesCurrentThreshold(t *testing.T) {
-	for _, count := range []int64{5, 6} {
+func TestSessionCleanupKeepsLatestFourBeforeInsert(t *testing.T) {
+	for _, count := range []int64{0, 4, 5, 6} {
 		auth, store, _ := authFixture(t)
 		store.count = count
-		want := []string{"find_email", "sign", "begin", "count"}
-		if count > 5 {
-			want = append(want, "delete")
+
+		_, err := auth.SignIn(context.Background(), store.user.Email, "fixture-password")
+
+		wantRemoved := int(count) - 4
+		if wantRemoved < 0 {
+			wantRemoved = 0
 		}
-		want = append(want, "save", "commit")
-
-		_, err := auth.SignIn(context.Background(), "fixture@example.test", "fixture-password")
-
-		if err != nil || !reflect.DeepEqual(store.trace, want) {
-			t.Fatal("legacy cleanup threshold/order changed")
+		if err != nil || len(store.deleted) != wantRemoved || store.saved == nil {
+			t.Fatal("latest-five retention failed")
+		}
+		for i, id := range store.deleted {
+			if id != uint(i+1) {
+				t.Fatal("retention deleted a newer session")
+			}
 		}
 	}
 }

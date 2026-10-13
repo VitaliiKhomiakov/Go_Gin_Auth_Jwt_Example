@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,17 +30,27 @@ func TestAccessTokenRoundTrip(t *testing.T) {
 	}
 
 	claims := decodedClaims(t, token)
-	if claims["exp"] != float64(codec.now().Add(15*time.Minute).Unix()) || claims["tokenType"] != string(AccessToken) || claims["userID"] != float64(7) {
+	if claims.ExpiresAt != codec.now().Add(15*time.Minute).Unix() || claims.TokenType != AccessToken || claims.UserID != 7 {
 		t.Fatal("access claims do not match the contract")
 	}
-	profile, ok := claims["user"].(map[string]any)
-	if !ok || len(profile) != 6 || profile["id"] != float64(7) || profile["email"] != user.Email {
+	if claims.User == nil || claims.User.ID != 7 || claims.User.Email != user.Email {
 		t.Fatal("public profile was not retained")
 	}
-	if _, present := profile["password"]; present {
+
+	var profile map[string]json.RawMessage
+	if err := json.Unmarshal(decodedPayload(t, token), &profile); err != nil {
+		t.Fatal("access payload decode failed")
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(profile["user"], &fields); err != nil || len(fields) != 6 {
+		t.Fatal("public profile allowlist changed")
+	}
+
+	if _, present := fields["password"]; present {
 		t.Fatal("public profile exposes password")
 	}
-	if _, present := profile["roles"]; present {
+	if _, present := fields["roles"]; present {
 		t.Fatal("public profile exposes roles")
 	}
 
@@ -56,40 +67,44 @@ func TestAccessTokenRoundTrip(t *testing.T) {
 			t.Fatal("public codec did not round trip")
 		}
 	}
-
 }
 
 func TestTokenRejectsInvalidClaims(t *testing.T) {
 	codec := fixtureCodec()
+	refresh, err := codec.sign(7, RefreshToken, nil)
+	if err != nil {
+		t.Fatal("classification refresh fixture failed")
+	}
+
 	for _, test := range []struct {
 		name  string
 		field string
-		value any
+		value json.RawMessage
 	}{
 		{"missing_user_id", "userID", nil},
-		{"null_user_id", "userID", json.RawMessage("null")},
-		{"zero_user_id", "userID", 0},
-		{"negative_user_id", "userID", -1},
-		{"fractional_user_id", "userID", 1.5},
-		{"string_user_id", "userID", "7"},
-		{"boolean_user_id", "userID", true},
-		{"overflow_user_id", "userID", json.Number("18446744073709551616")},
+		{"null_user_id", "userID", json.RawMessage(`null`)},
+		{"zero_user_id", "userID", json.RawMessage(`0`)},
+		{"negative_user_id", "userID", json.RawMessage(`-1`)},
+		{"fractional_user_id", "userID", json.RawMessage(`1.5`)},
+		{"string_user_id", "userID", json.RawMessage(`"7"`)},
+		{"boolean_user_id", "userID", json.RawMessage(`true`)},
+		{"overflow_user_id", "userID", json.RawMessage(`18446744073709551616`)},
 		{"missing_exp", "exp", nil},
-		{"null_exp", "exp", json.RawMessage("null")},
-		{"zero_exp", "exp", 0},
-		{"negative_exp", "exp", -1},
-		{"fractional_exp", "exp", 2000000000.5},
-		{"string_exp", "exp", "2000000000"},
-		{"overflow_exp", "exp", json.Number("9223372036854775808")},
+		{"null_exp", "exp", json.RawMessage(`null`)},
+		{"zero_exp", "exp", json.RawMessage(`0`)},
+		{"negative_exp", "exp", json.RawMessage(`-1`)},
+		{"fractional_exp", "exp", json.RawMessage(`2000000000.5`)},
+		{"string_exp", "exp", json.RawMessage(`"2000000000"`)},
+		{"overflow_exp", "exp", json.RawMessage(`9223372036854775808`)},
 		{"missing_purpose", "tokenType", nil},
-		{"unknown_purpose", "tokenType", "UNKNOWN"},
-		{"wrong_purpose", "tokenType", RefreshToken},
-		{"malformed_purpose", "tokenType", 7},
+		{"unknown_purpose", "tokenType", json.RawMessage(`"UNKNOWN"`)},
+		{"wrong_purpose", "tokenType", json.RawMessage(`"REFRESH_TOKEN"`)},
+		{"malformed_purpose", "tokenType", json.RawMessage(`7`)},
 		{"missing_jti", "jti", nil},
-		{"null_jti", "jti", json.RawMessage("null")},
-		{"empty_jti", "jti", ""},
-		{"whitespace_jti", "jti", " \t"},
-		{"malformed_jti", "jti", 7},
+		{"null_jti", "jti", json.RawMessage(`null`)},
+		{"empty_jti", "jti", json.RawMessage(`""`)},
+		{"whitespace_jti", "jti", json.RawMessage(`" \t"`)},
+		{"malformed_jti", "jti", json.RawMessage(`7`)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			claims := validFixtureClaims(codec)
@@ -98,10 +113,14 @@ func TestTokenRejectsInvalidClaims(t *testing.T) {
 			} else {
 				claims[test.field] = test.value
 			}
+
 			token := signFixture(t, claims, jwt.SigningMethodHS256, []byte(codec.keys.AccessSecretKey))
 
 			if id, err := codec.Validate(token, AccessToken); err == nil || id != 0 {
 				t.Fatal("invalid claims accepted")
+			}
+			if valid, err := codec.MatchesSessionContract(7, TokenPair{AccessToken: token, RefreshToken: refresh}); err != nil || valid {
+				t.Fatal("invalid typed claims classified current")
 			}
 		})
 	}
@@ -111,17 +130,17 @@ func TestTokenRejectsInvalidClaims(t *testing.T) {
 			t.Fatal("malformed token accepted")
 		}
 	}
-	old := signFixture(t, jwt.MapClaims{"user": map[string]any{"id": 7}, "exp": codec.now().Add(time.Hour).Unix()}, jwt.SigningMethodHS256, []byte(codec.keys.AccessSecretKey))
+	old := signFixture(t, map[string]json.RawMessage{"user": json.RawMessage(`{"id":7}`), "exp": json.RawMessage(strconv.FormatInt(codec.now().Add(time.Hour).Unix(), 10))}, jwt.SigningMethodHS256, []byte(codec.keys.AccessSecretKey))
 	if _, err := codec.Validate(old, AccessToken); err == nil {
 		t.Fatal("old access contract accepted")
 	}
-	old = signFixture(t, jwt.MapClaims{"userID": 7, "exp": codec.now().Add(time.Hour).Unix()}, jwt.SigningMethodHS256, []byte(codec.keys.RefreshSecretKey))
+	old = signFixture(t, map[string]json.RawMessage{"userID": json.RawMessage(`7`), "exp": json.RawMessage(strconv.FormatInt(codec.now().Add(time.Hour).Unix(), 10))}, jwt.SigningMethodHS256, []byte(codec.keys.RefreshSecretKey))
 	if _, err := codec.Validate(old, RefreshToken); err == nil {
 		t.Fatal("old refresh contract accepted")
 	}
 
 	claims := validFixtureClaims(codec)
-	claims["userID"] = json.Number(strconv.FormatUint(uint64(^uint(0)), 10))
+	claims["userID"] = json.RawMessage(strconv.FormatUint(uint64(^uint(0)), 10))
 	if id, err := codec.Validate(signFixture(t, claims, jwt.SigningMethodHS256, []byte(codec.keys.AccessSecretKey)), AccessToken); err != nil || id != ^uint(0) {
 		t.Fatal("valid maximum uint identity rejected or rounded")
 	}
@@ -142,7 +161,7 @@ func TestTokenPurposeAndExpiry(t *testing.T) {
 				other = AccessToken
 			}
 
-			if decodedClaims(t, token)["exp"] != float64(wantExpiry.Unix()) {
+			if decodedClaims(t, token).ExpiresAt != wantExpiry.Unix() {
 				t.Fatal("token lifetime changed")
 			}
 			if _, err := codec.Validate(token, other); err == nil {
@@ -166,7 +185,7 @@ func TestTokenPurposeAndExpiry(t *testing.T) {
 			t.Fatal("non-HS256 method accepted")
 		}
 	}
-	unsigned := signFixture(t, claims, jwt.SigningMethodNone, jwt.UnsafeAllowNoneSignatureType)
+	unsigned := signUnsignedFixture(t, claims)
 	if _, err := codec.Validate(unsigned, AccessToken); err == nil {
 		t.Fatal("unsigned token accepted")
 	}
@@ -198,9 +217,9 @@ func TestSameInstantTokensAreDistinct(t *testing.T) {
 			t.Fatal("same-instant tokens are identical")
 		}
 		for _, token := range []string{first, second} {
-			id, ok := decodedClaims(t, token)["jti"].(string)
+			id := decodedClaims(t, token).ID
 			bytes, err := hex.DecodeString(id)
-			if !ok || err != nil || len(bytes) != 16 {
+			if err != nil || len(bytes) != 16 {
 				t.Fatal("token ID is not 128 bits")
 			}
 		}
@@ -229,7 +248,6 @@ func TestTokenIssuanceRejectsInvalidInputs(t *testing.T) {
 	if _, err := NewJWTCodec(codec.keys); err == nil {
 		t.Fatal("identical keys accepted")
 	}
-
 }
 
 func fixtureCodec() JWTCodec {
@@ -239,13 +257,30 @@ func fixtureCodec() JWTCodec {
 	}
 }
 
-func validFixtureClaims(codec JWTCodec) jwt.MapClaims {
-	return jwt.MapClaims{"userID": 7, "exp": codec.now().Add(time.Hour).Unix(), "tokenType": AccessToken, "jti": "fixture-id"}
+type rawFixtureClaims json.RawMessage
+
+func (rawFixtureClaims) Valid() error { return nil }
+
+func (c rawFixtureClaims) MarshalJSON() ([]byte, error) { return c, nil }
+
+func validFixtureClaims(codec JWTCodec) map[string]json.RawMessage {
+	return map[string]json.RawMessage{
+		"userID":    json.RawMessage(`7`),
+		"exp":       json.RawMessage(strconv.FormatInt(codec.now().Add(time.Hour).Unix(), 10)),
+		"tokenType": json.RawMessage(`"ACCESS_TOKEN"`),
+		"jti":       json.RawMessage(`"fixture-id"`),
+	}
 }
 
-func signFixture(t *testing.T, claims jwt.MapClaims, method jwt.SigningMethod, key any) string {
+func signFixture(t *testing.T, claims map[string]json.RawMessage, method *jwt.SigningMethodHMAC, key []byte) string {
 	t.Helper()
-	token, err := jwt.NewWithClaims(method, claims).SignedString(key)
+
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal("fixture claims encoding failed")
+	}
+
+	token, err := jwt.NewWithClaims(method, rawFixtureClaims(payload)).SignedString(key)
 	if err != nil {
 		t.Fatal("fixture signing failed")
 	}
@@ -253,14 +288,47 @@ func signFixture(t *testing.T, claims jwt.MapClaims, method jwt.SigningMethod, k
 	return token
 }
 
-func decodedClaims(t *testing.T, token string) map[string]any {
+func signUnsignedFixture(t *testing.T, claims map[string]json.RawMessage) string {
 	t.Helper()
-	parsed, _, err := (&jwt.Parser{}).ParseUnverified(token, jwt.MapClaims{})
+
+	payload, err := json.Marshal(claims)
 	if err != nil {
-		t.Fatal("issued claims could not be decoded")
+		t.Fatal("unsigned fixture encoding failed")
 	}
 
-	return parsed.Claims.(jwt.MapClaims)
+	token, err := jwt.NewWithClaims(jwt.SigningMethodNone, rawFixtureClaims(payload)).SignedString(jwt.UnsafeAllowNoneSignatureType)
+	if err != nil {
+		t.Fatal("unsigned fixture signing failed")
+	}
+
+	return token
+}
+
+func decodedPayload(t *testing.T, token string) []byte {
+	t.Helper()
+
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatal("issued token shape invalid")
+	}
+
+	payload, err := jwt.DecodeSegment(parts[1])
+	if err != nil {
+		t.Fatal("issued payload decode failed")
+	}
+
+	return payload
+}
+
+func decodedClaims(t *testing.T, token string) tokenClaims {
+	t.Helper()
+
+	var claims tokenClaims
+	if err := json.Unmarshal(decodedPayload(t, token), &claims); err != nil {
+		t.Fatal("issued typed claims decode failed")
+	}
+
+	return claims
 }
 
 type failingEntropy struct{ calls, failOn int }
@@ -289,5 +357,58 @@ func TestJWTIssueDiscardsPartialPair(t *testing.T) {
 		if err == nil || pair != (TokenPair{}) || entropy.calls != failOn {
 			t.Fatal("signing failure returned partial pair or continued")
 		}
+	}
+}
+
+func TestStoredSessionContractClassification(t *testing.T) {
+	codec := fixtureCodec()
+	pair, err := codec.Issue(&model.User{ID: 7})
+	if err != nil {
+		t.Fatal("classification fixture failed")
+	}
+	later := codec
+	later.now = func() time.Time { return codec.now().AddDate(1, 0, 0) }
+
+	if valid, err := later.MatchesSessionContract(7, pair); err != nil || !valid {
+		t.Fatal("elapsed expiry retired current contract")
+	}
+	if _, err := later.Validate(pair.RefreshToken, RefreshToken); !errors.Is(err, ErrInvalidToken) {
+		t.Fatal("classifier weakened strict expiry")
+	}
+	for _, test := range []struct {
+		name  string
+		owner uint
+		pair  TokenPair
+	}{
+		{"wrong_owner", 8, pair},
+		{"bad_access", 7, TokenPair{AccessToken: "obsolete", RefreshToken: pair.RefreshToken}},
+		{"bad_refresh", 7, TokenPair{AccessToken: pair.AccessToken, RefreshToken: "obsolete"}},
+		{"swapped", 7, TokenPair{AccessToken: pair.RefreshToken, RefreshToken: pair.AccessToken}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if valid, err := later.MatchesSessionContract(test.owner, test.pair); err != nil || valid {
+				t.Fatal("invalid contract classified current")
+			}
+		})
+	}
+	for _, field := range []string{"userID", "exp", "tokenType", "jti"} {
+		claims := validFixtureClaims(codec)
+		delete(claims, field)
+		broken := pair
+		broken.AccessToken = signFixture(t, claims, jwt.SigningMethodHS256, []byte(codec.keys.AccessSecretKey))
+		if valid, err := later.MatchesSessionContract(7, broken); err != nil || valid {
+			t.Fatal("missing contract field accepted")
+		}
+	}
+	for _, method := range []*jwt.SigningMethodHMAC{jwt.SigningMethodHS384, jwt.SigningMethodHS512} {
+		broken := pair
+		broken.AccessToken = signFixture(t, validFixtureClaims(codec), method, []byte(codec.keys.AccessSecretKey))
+		if valid, err := codec.MatchesSessionContract(7, broken); err != nil || valid {
+			t.Fatal("non-HS256 classified current")
+		}
+	}
+	codec.keys.RefreshSecretKey = codec.keys.AccessSecretKey
+	if valid, err := codec.MatchesSessionContract(7, pair); err == nil || errors.Is(err, ErrInvalidToken) || valid {
+		t.Fatal("configuration failure became obsolete row")
 	}
 }

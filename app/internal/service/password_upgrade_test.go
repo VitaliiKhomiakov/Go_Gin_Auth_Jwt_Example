@@ -26,7 +26,7 @@ func TestLegacyPasswordUpgrade(t *testing.T) {
 
 	pair, err = auth.SignIn(ctx, store.user.Email, "fixture-password")
 
-	want := []string{"find_email", "update_password", "sign", "begin", "count", "save", "commit"}
+	want := []string{"find_email", "update_password", "begin", "page", "sign", "save", "commit"}
 	if err != nil || pair == (TokenPair{}) || store.updates != 1 || !strings.HasPrefix(store.user.Password, passwordPrefix) || !reflect.DeepEqual(store.trace, want) {
 		t.Fatal("first legacy login did not upgrade before issuing")
 	}
@@ -35,7 +35,7 @@ func TestLegacyPasswordUpgrade(t *testing.T) {
 
 	pair, err = auth.SignIn(ctx, store.user.Email, "fixture-password")
 
-	if err != nil || pair == (TokenPair{}) || store.updates != 1 || store.user.Password != upgraded || !reflect.DeepEqual(store.trace, []string{"find_email", "sign", "begin", "count", "save", "commit"}) {
+	if err != nil || pair == (TokenPair{}) || store.updates != 1 || store.user.Password != upgraded || !reflect.DeepEqual(store.trace, []string{"find_email", "begin", "page", "sign", "save", "commit"}) {
 		t.Fatal("subsequent login rewrote the upgraded credential")
 	}
 	for _, actual := range store.contexts {

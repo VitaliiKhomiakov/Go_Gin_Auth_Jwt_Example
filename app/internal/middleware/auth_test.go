@@ -28,14 +28,24 @@ func (f *accessFake) AuthenticateAccessToken(ctx context.Context, token string) 
 	return f.user, f.err
 }
 
-func readMiddlewareJSON(t *testing.T, response *httptest.ResponseRecorder) map[string]any {
+type identityResponse struct {
+	ID    uint   `json:"id"`
+	Email string `json:"email"`
+}
+
+type middlewareTestResponse interface {
+	errorResponse | identityResponse
+}
+
+func readMiddlewareJSON[T middlewareTestResponse](t *testing.T, response *httptest.ResponseRecorder) T {
 	t.Helper()
-	var body map[string]any
+	var body T
 	decoder := json.NewDecoder(response.Body)
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&body); err != nil {
 		t.Fatal("response must contain JSON")
 	}
-	var extra any
+	var extra json.RawMessage
 	if err := decoder.Decode(&extra); err != io.EOF {
 		t.Fatal("response must contain exactly one JSON object")
 	}
@@ -48,19 +58,19 @@ func TestAuthorizationHeaderValidation(t *testing.T) {
 		fake := &accessFake{}
 		downstream := 0
 		router := gin.New()
-		router.GET("/auth", AuthMiddleware(fake), func(c *gin.Context) { downstream++; c.JSON(200, gin.H{"unexpected": true}) })
+		router.GET("/auth", AuthMiddleware(fake), func(c *gin.Context) { downstream++; c.Status(200) })
 		response := httptest.NewRecorder()
 		request := httptest.NewRequest("GET", "/auth", nil)
 		request.Header.Set("Authorization", header)
 
 		router.ServeHTTP(response, request)
 
-		body := readMiddlewareJSON(t, response)
+		body := readMiddlewareJSON[errorResponse](t, response)
 		want := "Authorization header is invalid"
 		if header == "" {
 			want = "Authorization header is missing"
 		}
-		if response.Code != 401 || fake.calls != 0 || downstream != 0 || len(body) != 1 || body["error"] != want {
+		if response.Code != 401 || fake.calls != 0 || downstream != 0 || body.Error != want {
 			t.Fatal("invalid header continued")
 		}
 	}
@@ -80,7 +90,7 @@ func TestAuthorizationAcceptsBearerWhitespaceAndCase(t *testing.T) {
 			if !ok || identity != user {
 				t.Fatal("pointer identity changed")
 			}
-			c.JSON(200, gin.H{"id": user.ID, "email": user.Email})
+			c.JSON(200, identityResponse{ID: user.ID, Email: user.Email})
 		})
 		response := httptest.NewRecorder()
 		request := httptest.NewRequest("GET", "/auth", nil).WithContext(ctx)
@@ -88,8 +98,8 @@ func TestAuthorizationAcceptsBearerWhitespaceAndCase(t *testing.T) {
 
 		router.ServeHTTP(response, request)
 
-		body := readMiddlewareJSON(t, response)
-		if response.Code != 200 || downstream != 1 || fake.calls != 1 || fake.ctx != ctx || fake.token != "fixture-token" || len(body) != 2 {
+		body := readMiddlewareJSON[identityResponse](t, response)
+		if response.Code != 200 || downstream != 1 || fake.calls != 1 || fake.ctx != ctx || fake.token != "fixture-token" || body != (identityResponse{ID: 7, Email: "fixture@example.test"}) {
 			t.Fatal("valid header/context/call contract changed")
 		}
 	}
@@ -110,15 +120,15 @@ func TestAuthenticationFailureStopsWithSafeErrors(t *testing.T) {
 		identitySet := false
 		router := gin.New()
 		router.Use(func(c *gin.Context) { c.Next(); _, identitySet = c.Get("user") })
-		router.GET("/auth", AuthMiddleware(fake), func(c *gin.Context) { downstream++; c.JSON(200, gin.H{"unexpected": true}) })
+		router.GET("/auth", AuthMiddleware(fake), func(c *gin.Context) { downstream++; c.Status(200) })
 		response := httptest.NewRecorder()
 		request := httptest.NewRequest("GET", "/auth", nil)
 		request.Header.Set("Authorization", "Bearer synthetic-jwt")
 
 		router.ServeHTTP(response, request)
 
-		body := readMiddlewareJSON(t, response)
-		if response.Code != test.status || downstream != 0 || identitySet || fake.calls != 1 || len(body) != 1 || body["error"] != test.message {
+		body := readMiddlewareJSON[errorResponse](t, response)
+		if response.Code != test.status || downstream != 0 || identitySet || fake.calls != 1 || body.Error != test.message {
 			t.Fatal("authentication failure continued or exposed details")
 		}
 	}

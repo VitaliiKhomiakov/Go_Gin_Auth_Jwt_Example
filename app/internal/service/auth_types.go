@@ -17,6 +17,7 @@ type SignUpInput struct {
 }
 
 var (
+	ErrSessionNotFound    = errors.New("session not found")
 	ErrUserNotFound       = errors.New("user not found")
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrInvalidToken       = errors.New("token is invalid")

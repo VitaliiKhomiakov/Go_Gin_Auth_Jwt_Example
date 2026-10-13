@@ -16,17 +16,21 @@ type AccessAuthenticator interface {
 	AuthenticateAccessToken(context.Context, string) (*model.User, error)
 }
 
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
 func AuthMiddleware(auth AccessAuthenticator) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		header := c.GetHeader("Authorization")
 		if header == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header is missing"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, errorResponse{Error: "Authorization header is missing"})
 			return
 		}
 
 		fields := strings.Fields(header)
 		if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header is invalid"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, errorResponse{Error: "Authorization header is invalid"})
 			return
 		}
 
@@ -37,11 +41,11 @@ func AuthMiddleware(auth AccessAuthenticator) gin.HandlerFunc {
 				status, message = http.StatusUnauthorized, "Authentication failed"
 			}
 
-			c.AbortWithStatusJSON(status, gin.H{"error": message})
+			c.AbortWithStatusJSON(status, errorResponse{Error: message})
 			return
 		}
 		if user == nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+			c.AbortWithStatusJSON(http.StatusInternalServerError, errorResponse{Error: "Internal server error"})
 			return
 		}
 

@@ -9,6 +9,31 @@ import (
 	"auth/internal/model"
 )
 
+type AuthStore interface {
+	FindUserByEmail(context.Context, string) (model.User, error)
+	FindUserByID(context.Context, uint) (*model.User, error)
+	CreateUser(context.Context, *model.User) error
+	// UpdatePasswordIfCurrent reports whether the credential matched and was replaced.
+	UpdatePasswordIfCurrent(ctx context.Context, userID uint, current, replacement string) (bool, error)
+	HasAccessToken(context.Context, uint, string) (bool, error)
+	WithSessionTransaction(context.Context, uint, func(*model.User, SessionWriter) error) error
+}
+
+// SessionWriter is valid only within the transaction callback that supplies it.
+type SessionWriter interface {
+	TokensAfter(context.Context, uint) ([]model.Token, error)
+	DeleteTokenIDs(context.Context, []uint) error
+	SaveToken(context.Context, TokenPair) error
+	FindRefreshToken(context.Context, string) (model.Token, error)
+	ReplaceToken(context.Context, model.Token, TokenPair) (bool, error)
+}
+
+type TokenCodec interface {
+	Issue(*model.User) (TokenPair, error)
+	Validate(string, TokenType) (uint, error)
+	MatchesSessionContract(uint, TokenPair) (bool, error)
+}
+
 type Auth struct {
 	store  AuthStore
 	tokens TokenCodec
@@ -89,26 +114,6 @@ func (a *Auth) upgradePassword(ctx context.Context, user *model.User, password s
 	return current, nil
 }
 
-func (a *Auth) RefreshSession(ctx context.Context, refreshToken string) (TokenPair, error) {
-	userID, err := a.tokens.Validate(refreshToken, RefreshToken)
-	if err != nil {
-		return TokenPair{}, err
-	}
-
-	user, err := a.store.FindUserByID(ctx, userID)
-	if errors.Is(err, ErrUserNotFound) {
-		return TokenPair{}, ErrInvalidToken
-	}
-	if err != nil {
-		return TokenPair{}, fmt.Errorf("find refresh user: %w", err)
-	}
-	if !user.Enabled {
-		return TokenPair{}, ErrInvalidToken
-	}
-
-	return a.issueSession(ctx, user)
-}
-
 func (a *Auth) AuthenticateAccessToken(ctx context.Context, accessToken string) (*model.User, error) {
 	userID, err := a.tokens.Validate(accessToken, AccessToken)
 	if err != nil {
@@ -123,6 +128,14 @@ func (a *Auth) AuthenticateAccessToken(ctx context.Context, accessToken string) 
 		return nil, fmt.Errorf("find access user: %w", err)
 	}
 	if !user.Enabled {
+		return nil, ErrInvalidToken
+	}
+
+	present, err := a.store.HasAccessToken(ctx, userID, accessToken)
+	if err != nil {
+		return nil, fmt.Errorf("find access session: %w", err)
+	}
+	if !present {
 		return nil, ErrInvalidToken
 	}
 
@@ -153,38 +166,4 @@ func (a *Auth) SignUp(ctx context.Context, input SignUpInput) (UserWithoutSecret
 	}
 
 	return toPublicUser(&user), nil
-}
-
-func (a *Auth) issueSession(ctx context.Context, user *model.User) (TokenPair, error) {
-	pair, err := a.tokens.Issue(user)
-	if err != nil {
-		return TokenPair{}, fmt.Errorf("issue session tokens: %w", err)
-	}
-
-	err = a.store.WithSessionTransaction(ctx, func(writer SessionWriter) error {
-		if err := pruneStoredSessions(ctx, writer, user.ID); err != nil {
-			return err
-		}
-
-		return writer.SaveToken(ctx, &model.Token{
-			UserID: uint64(user.ID), AccessToken: pair.AccessToken, RefreshToken: pair.RefreshToken,
-		})
-	})
-	if err != nil {
-		return TokenPair{}, fmt.Errorf("persist session: %w", err)
-	}
-
-	return pair, nil
-}
-
-func pruneStoredSessions(ctx context.Context, writer SessionWriter, userID uint) error {
-	count, err := writer.CountTokens(ctx, userID)
-	if err != nil {
-		return err
-	}
-	if count > 5 {
-		return writer.DeleteTokens(ctx, userID)
-	}
-
-	return nil
 }

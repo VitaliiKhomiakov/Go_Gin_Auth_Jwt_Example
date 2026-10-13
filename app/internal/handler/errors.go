@@ -22,5 +22,5 @@ func writeAuthError(c *gin.Context, err error) {
 		status, message = http.StatusBadRequest, "Incorrect data"
 	}
 
-	c.AbortWithStatusJSON(status, gin.H{"error": message})
+	c.AbortWithStatusJSON(status, errorResponse{Error: message})
 }
