@@ -20,7 +20,7 @@ services:
     environment:
       POSTGRES_HOST: localhost
       POSTGRES_USER: root
-      POSTGRES_PASSWORD: 900800
+      POSTGRES_PASSWORD: 0123456789
       POSTGRES_DB: ex
     networks:
       - server-net

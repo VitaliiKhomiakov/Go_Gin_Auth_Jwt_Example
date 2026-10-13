@@ -1,2 +1,12 @@
+# Local Agent Engineering Kit instructions and project agent settings
+/AGENTS.md
+/ARCHITECTURE.md
+/PLANS.md
+/.agents-framework/
+/.codex/config.toml
+/.codex/agents/af-architect.toml
+/.codex/agents/af-implementer.toml
+/.codex/agents/af-reviewer.toml
+/docs/plans/
 .idea
 /app/tmp
