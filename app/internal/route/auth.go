@@ -1,14 +1,14 @@
 package route
 
 import (
-	"auth/internal/controller"
-	"auth/internal/middleware"
+	"auth/internal/handler"
+
 	"github.com/gin-gonic/gin"
 )
 
-func auth(r *gin.Engine) {
-	r.POST("/auth/login", middleware.LoginMiddleware(), controller.Login)
-	r.POST("/auth/signUp", middleware.SignUpMiddleware(), controller.SingUp)
-	r.GET("/auth/validate", middleware.AuthMiddleware(), controller.Validate)
-	r.POST("/auth/refresh", middleware.RefreshMiddleware(), controller.Refresh)
+func auth(r *gin.Engine, h *handler.Auth, authenticate gin.HandlerFunc) {
+	r.POST("/auth/login", h.Login)
+	r.POST("/auth/signUp", h.SignUp)
+	r.GET("/auth/me", authenticate, h.Me)
+	r.POST("/auth/refresh", h.Refresh)
 }

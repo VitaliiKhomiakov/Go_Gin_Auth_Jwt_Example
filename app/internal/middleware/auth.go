@@ -1,90 +1,51 @@
 package middleware
 
 import (
-	"auth/internal/repository"
-	"auth/internal/service"
-	"auth/internal/validator"
-	"github.com/gin-gonic/gin"
+	"context"
+	"errors"
 	"net/http"
+	"strings"
+
+	"auth/internal/model"
+	"auth/internal/service"
+
+	"github.com/gin-gonic/gin"
 )
 
-type RefreshToken struct {
-	RefreshToken string `json:"refreshToken" binding:"required"`
+type AccessAuthenticator interface {
+	AuthenticateAccessToken(context.Context, string) (*model.User, error)
 }
 
-func SignUpMiddleware() gin.HandlerFunc {
-	return validator.SingUpValidator()
-}
-
-func LoginMiddleware() gin.HandlerFunc {
-	validatorHandler := validator.LoginValidator()
-
+func AuthMiddleware(auth AccessAuthenticator) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		validatorHandler(c)
-		loginUser := c.MustGet("loginUser").(validator.Login)
-		user, err := service.Authenticate(loginUser.EmailOrPhone, loginUser.Password)
-
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			c.Abort()
-		}
-
-		c.Set("user", user)
-		c.Next()
-	}
-}
-
-func AuthMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header is missing"})
-			c.Abort()
+		header := c.GetHeader("Authorization")
+		if header == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header is missing"})
 			return
 		}
 
-		tokenString := authHeader[len("Bearer "):]
-
-		userId, err := service.ValidateToken(tokenString, service.AccessToken)
-
-		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-			c.Abort()
+		fields := strings.Fields(header)
+		if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header is invalid"})
 			return
 		}
 
-		user, err := repository.GetUserRepository().GetUserByID(uint(userId))
-
+		user, err := auth.AuthenticateAccessToken(c.Request.Context(), fields[1])
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-			c.Abort()
+			status, message := http.StatusInternalServerError, "Internal server error"
+			if errors.Is(err, service.ErrInvalidToken) {
+				status, message = http.StatusUnauthorized, "Authentication failed"
+			}
+
+			c.AbortWithStatusJSON(status, gin.H{"error": message})
+			return
+		}
+		if user == nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
 			return
 		}
 
 		c.Set("user", user)
-		c.Next()
-	}
-}
-
-func RefreshMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var refreshToken RefreshToken
-
-		if err := c.ShouldBindJSON(&refreshToken); err != nil {
-			service.GetErrorService(c).SendError(http.StatusUnauthorized, "auth.refresh_token_incorrect", "Refresh token is incorrect")
-			c.Abort()
-			return
-		}
-
-		userId, err := service.ValidateToken(refreshToken.RefreshToken, service.RefreshToken)
-
-		if err != nil {
-			service.GetErrorService(c).SendError(http.StatusUnauthorized, "auth.refresh_token_invalid", err.Error())
-			c.Abort()
-			return
-		}
-
-		c.Set("userId", userId)
 		c.Next()
 	}
 }

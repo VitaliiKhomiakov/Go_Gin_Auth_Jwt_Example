@@ -1,16 +1,14 @@
 package route
 
 import (
-	"auth/internal/controller"
+	"auth/internal/handler"
+
 	"github.com/gin-gonic/gin"
 )
 
-func InitRoute(r *gin.Engine) {
-	base(r)
-	auth(r)
-}
+func InitRoute(r *gin.Engine, h *handler.Auth, authenticate gin.HandlerFunc, health gin.HandlerFunc) {
+	r.GET("/", handler.Base)
+	r.GET("/health", health)
 
-func base(r *gin.Engine) {
-	r.GET("/", controller.Base)
-	r.GET("/health", controller.Health)
+	auth(r, h, authenticate)
 }
