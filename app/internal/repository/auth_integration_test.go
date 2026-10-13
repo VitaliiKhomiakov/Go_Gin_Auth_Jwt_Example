@@ -218,6 +218,10 @@ func TestAuthRepositoryCancellation(t *testing.T) {
 		func() error { _, err := store.FindUserByID(ctx, 7); return err },
 		func() error { return store.CreateUser(ctx, user) },
 		func() error {
+			_, err := store.UpdatePasswordIfCurrent(ctx, 7, "current-hash", "replacement-hash")
+			return err
+		},
+		func() error {
 			return store.WithSessionTransaction(ctx, func(service.SessionWriter) error { t.Fatal("cancelled transaction invoked callback"); return nil })
 		},
 	}
@@ -268,6 +272,15 @@ func TestAuthRepositoryDoesNotLogSecrets(t *testing.T) {
 	if _, err := store.FindUserByEmail(context.Background(), "private-email@example.test"); !errors.Is(err, service.ErrUserNotFound) {
 		t.Fatal("privacy lookup did not classify")
 	}
+	updated, err := store.UpdatePasswordIfCurrent(context.Background(), user.ID, user.Password, "synthetic-private-replacement-hash")
+	if err != nil || !updated {
+		t.Fatal("privacy conditional update failed")
+	}
+	updated, err = store.UpdatePasswordIfCurrent(context.Background(), user.ID, "synthetic-private-replacement-hash", strings.Repeat("private-too-long-hash", 20))
+	if err == nil || updated {
+		t.Fatal("privacy conditional update did not fail")
+	}
+
 	token := &model.Token{UserID: uint64(user.ID), AccessToken: "synthetic-private-access-token", RefreshToken: "synthetic-private-refresh-token"}
 	if err := store.WithSessionTransaction(context.Background(), func(writer service.SessionWriter) error { return writer.SaveToken(context.Background(), token) }); err != nil {
 		t.Fatal("privacy session creation failed")
@@ -326,6 +339,10 @@ func TestAuthRouteJourney(t *testing.T) {
 	var roles []string
 	if err := json.Unmarshal([]byte(persisted.Roles), &roles); err != nil || !reflect.DeepEqual(roles, []string{"STANDARD_USER"}) || !persisted.Enabled {
 		t.Fatal("privileged signup input changed persisted registration policy")
+	}
+	valid, upgrade, err := service.VerifyPassword("fixture-password", persisted.Password)
+	if err != nil || !valid || upgrade || !strings.HasPrefix(persisted.Password, "$argon2id$") {
+		t.Fatal("signup did not persist the accepted password format")
 	}
 	if float64(persisted.ID) != id {
 		t.Fatal("signup identity differs from persisted user")

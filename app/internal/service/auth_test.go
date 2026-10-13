@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +21,8 @@ type authStoreFake struct {
 	created                                                     *model.User
 	saved                                                       *model.Token
 	transactions                                                int
+	updates                                                     int
+	updateFn                                                    func(context.Context, uint, string, string) (bool, error)
 }
 
 func (f *authStoreFake) FindUserByEmail(ctx context.Context, email string) (model.User, error) {
@@ -31,6 +35,24 @@ func (f *authStoreFake) FindUserByID(ctx context.Context, id uint) (*model.User,
 	f.contexts = append(f.contexts, ctx)
 	f.trace = append(f.trace, "find_id")
 	return &f.user, f.findErr
+}
+
+func (f *authStoreFake) UpdatePasswordIfCurrent(ctx context.Context, id uint, current, replacement string) (bool, error) {
+	f.contexts = append(f.contexts, ctx)
+	f.trace = append(f.trace, "update_password")
+	f.updates++
+	if f.updateFn != nil {
+		return f.updateFn(ctx, id, current, replacement)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if f.user.ID != id || f.user.Password != current {
+		return false, nil
+	}
+
+	f.user.Password = replacement
+	return true, nil
 }
 
 func (f *authStoreFake) CreateUser(ctx context.Context, user *model.User) error {
@@ -78,10 +100,12 @@ type tokenCodecFake struct {
 	store                 *authStoreFake
 	issueErr, validateErr error
 	purposes              []TokenType
+	issuedUser            model.User
 }
 
 func (f *tokenCodecFake) Issue(user *model.User) (TokenPair, error) {
 	f.store.trace = append(f.store.trace, "sign")
+	f.issuedUser = *user
 	return TokenPair{AccessToken: "synthetic-access", RefreshToken: "synthetic-refresh"}, f.issueErr
 }
 
@@ -91,13 +115,17 @@ func (f *tokenCodecFake) Validate(token string, purpose TokenType) (uint, error)
 	return 7, f.validateErr
 }
 
+var fixturePasswordOnce sync.Once
+var fixturePassword string
+var fixturePasswordErr error
+
 func authFixture(t *testing.T) (*Auth, *authStoreFake, *tokenCodecFake) {
 	t.Helper()
-	password, err := hashPassword("fixture-password", "your_salt")
-	if err != nil {
+	fixturePasswordOnce.Do(func() { fixturePassword, fixturePasswordErr = HashPassword("fixture-password") })
+	if fixturePasswordErr != nil {
 		t.Fatal("fixture hash failed")
 	}
-	store := &authStoreFake{user: model.User{ID: 7, Email: "fixture@example.test", Password: password, Enabled: true}}
+	store := &authStoreFake{user: model.User{ID: 7, Email: "fixture@example.test", Password: fixturePassword, Enabled: true}}
 	codec := &tokenCodecFake{store: store}
 	return NewAuth(store, codec), store, codec
 }
@@ -130,7 +158,7 @@ func TestAuthOperationsWithoutGin(t *testing.T) {
 			case "signup":
 				var user UserWithoutSecret
 				user, err = auth.SignUp(ctx, SignUpInput{Email: "fixture@example.test", Password: "fixture-password", FirstName: "First", LastName: "Last"})
-				if user.ID != 7 || user.Email != "fixture@example.test" || store.created.Password != store.user.Password {
+				if user.ID != 7 || user.Email != "fixture@example.test" || !strings.HasPrefix(store.created.Password, passwordPrefix) {
 					t.Fatal("signup compatibility changed")
 				}
 			}

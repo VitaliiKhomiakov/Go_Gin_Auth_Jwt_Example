@@ -36,3 +36,17 @@ func (r *AuthStore) CreateUser(ctx context.Context, user *model.User) error {
 
 	return nil
 }
+
+func (r *AuthStore) UpdatePasswordIfCurrent(ctx context.Context, userID uint, current, replacement string) (bool, error) {
+	result := r.db.WithContext(ctx).Model(&model.User{}).
+		Where("id = ? AND password = ?", userID, current).
+		UpdateColumn("password", replacement)
+	if result.Error != nil {
+		return false, storageError(result.Error)
+	}
+	if result.RowsAffected > 1 {
+		return false, errors.New("password update affected multiple users")
+	}
+
+	return result.RowsAffected == 1, nil
+}

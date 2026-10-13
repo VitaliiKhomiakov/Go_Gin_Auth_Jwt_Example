@@ -30,7 +30,7 @@ func (a *Auth) SignIn(ctx context.Context, email, password string) (TokenPair, e
 		return TokenPair{}, ErrInvalidCredentials
 	}
 
-	valid, err := CheckPassword(password, "your_salt", user.Password)
+	valid, needsUpgrade, err := VerifyPassword(password, user.Password)
 	if err != nil {
 		return TokenPair{}, fmt.Errorf("check password: %w", err)
 	}
@@ -38,7 +38,55 @@ func (a *Auth) SignIn(ctx context.Context, email, password string) (TokenPair, e
 		return TokenPair{}, ErrInvalidCredentials
 	}
 
+	if needsUpgrade {
+		current, err := a.upgradePassword(ctx, &user, password)
+		if err != nil {
+			return TokenPair{}, err
+		}
+		return a.issueSession(ctx, current)
+	}
+
 	return a.issueSession(ctx, &user)
+}
+
+func (a *Auth) upgradePassword(ctx context.Context, user *model.User, password string) (*model.User, error) {
+	encoded, err := HashPassword(password)
+	if err != nil {
+		return nil, fmt.Errorf("hash upgraded password: %w", err)
+	}
+
+	updated, err := a.store.UpdatePasswordIfCurrent(ctx, user.ID, user.Password, encoded)
+	if err != nil {
+		return nil, fmt.Errorf("update legacy password: %w", err)
+	}
+	if updated {
+		user.Password = encoded
+		return user, nil
+	}
+
+	current, err := a.store.FindUserByID(ctx, user.ID)
+	if errors.Is(err, ErrUserNotFound) {
+		return nil, ErrInvalidCredentials
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reload sign-in user: %w", err)
+	}
+	if !current.Enabled {
+		return nil, ErrInvalidCredentials
+	}
+
+	valid, needsUpgrade, err := VerifyPassword(password, current.Password)
+	if err != nil {
+		return nil, fmt.Errorf("check current password: %w", err)
+	}
+	if !valid {
+		return nil, ErrInvalidCredentials
+	}
+	if needsUpgrade {
+		return nil, errors.New("password upgrade did not establish a current credential")
+	}
+
+	return current, nil
 }
 
 func (a *Auth) RefreshSession(ctx context.Context, refreshToken string) (TokenPair, error) {
@@ -91,7 +139,7 @@ func (a *Auth) SignUp(ctx context.Context, input SignUpInput) (UserWithoutSecret
 		}
 	}
 
-	password, err := hashPassword(input.Password, "your_salt")
+	password, err := HashPassword(input.Password)
 	if err != nil {
 		return UserWithoutSecret{}, fmt.Errorf("hash signup password: %w", err)
 	}
