@@ -4,11 +4,12 @@ services:
   ex-auth:
     container_name: ex-auth
     build:
-      context: ./auth
+      context: ./app
+      dockerfile: ../docker/Dockerfile
     ports:
       - "8001:8001"
     volumes:
-      - ./auth/app:/app
+      - ./app:/app
     networks:
       - server-net
 
